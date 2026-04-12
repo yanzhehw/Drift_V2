@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <key>CFBundleExecutable</key>
+    <string>Drift_V2</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.local.DriftV2ScreenSaver</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleName</key>
+    <string>Drift_V2</string>
+
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>7.0.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>7.0.0</string>
+
+    <key>NSPrincipalClass</key>
+    <string>DriftV2ScreenSaverView</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+</dict>
+</plist>

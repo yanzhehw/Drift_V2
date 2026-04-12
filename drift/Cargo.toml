@@ -1,0 +1,21 @@
+[package]
+name = "drift-v2-screensaver"
+version.workspace = true
+description = "macOS screen saver FFI for Drift_V2"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "drift_v2_screensaver"
+crate-type = ["staticlib"]
+
+[dependencies]
+flux.workspace = true
+wgpu.workspace = true
+raw-window-handle.workspace = true
+image.workspace = true
+pollster.workspace = true
+log.workspace = true
