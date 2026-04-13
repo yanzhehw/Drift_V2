@@ -69,7 +69,7 @@ impl DriftPreset {
             Self::Original => ColorMode::Preset(ColorPreset::Original),
             Self::Plasma => ColorMode::Preset(ColorPreset::Plasma),
             Self::Poolside => ColorMode::Preset(ColorPreset::Poolside),
-            _ => ColorMode::Preset(ColorPreset::Original),
+            Self::Gumdrop | Self::Silver | Self::Freedom => ColorMode::EmbeddedImage,
         }
     }
 

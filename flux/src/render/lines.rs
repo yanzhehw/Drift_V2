@@ -176,6 +176,9 @@ impl Context {
             }
         }
 
+        // Ensure the uniform reflects the authoritative color_mode
+        self.line_uniforms.color_mode = self.color_mode;
+
         queue.write_buffer(
             &self.line_uniform_buffer,
             0,

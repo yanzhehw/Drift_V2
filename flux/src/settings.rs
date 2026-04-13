@@ -96,6 +96,7 @@ impl Default for PressureMode {
 pub enum ColorMode {
     Preset(ColorPreset),
     ImageFile(std::path::PathBuf),
+    EmbeddedImage,
 }
 
 impl Default for ColorMode {
@@ -109,7 +110,7 @@ impl From<ColorMode> for u32 {
         match val {
             ColorMode::Preset(ColorPreset::Original) => 0,
             ColorMode::Preset(_) => 1,
-            ColorMode::ImageFile(_) => 2,
+            ColorMode::ImageFile(_) | ColorMode::EmbeddedImage => 2,
         }
     }
 }
@@ -120,7 +121,6 @@ pub enum ColorPreset {
     Original,
     Plasma,
     Poolside,
-    Freedom,
 }
 
 impl ColorPreset {
