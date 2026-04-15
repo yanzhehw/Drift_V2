@@ -22,7 +22,8 @@ DriftHandle *drift_create(void *ns_view,
                            uint32_t physical_width,
                            uint32_t physical_height,
                            float scale_factor,
-                           uint32_t preset);
+                           uint32_t preset,
+                           uint32_t is_preview);
 
 void drift_animate(DriftHandle *handle);
 

@@ -31,8 +31,12 @@ MACOS_DIR="$BUNDLE_DIR/Contents/MacOS"
 echo "==> Assembling bundle layout..."
 rm -rf "$BUNDLE_DIR"
 mkdir -p "$MACOS_DIR"
+mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
 cp "$SCRIPT_DIR/Info.plist" "$BUNDLE_DIR/Contents/"
+if [ -f "$SCRIPT_DIR/thumbnail.png" ]; then
+    cp "$SCRIPT_DIR/thumbnail.png" "$BUNDLE_DIR/Contents/Resources/thumbnail.png"
+fi
 
 echo "==> Compiling Objective-C and linking bundle..."
 clang -bundle \

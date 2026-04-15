@@ -90,7 +90,11 @@ MACOS_DIR="$BUNDLE_DIR/Contents/MacOS"
 
 rm -rf "$BUNDLE_DIR"
 mkdir -p "$MACOS_DIR"
+mkdir -p "$BUNDLE_DIR/Contents/Resources"
 cp "$SAVER_DIR/Info.plist" "$BUNDLE_DIR/Contents/"
+if [ -f "$SAVER_DIR/thumbnail.png" ]; then
+    cp "$SAVER_DIR/thumbnail.png" "$BUNDLE_DIR/Contents/Resources/thumbnail.png"
+fi
 
 clang -bundle \
     -fobjc-arc \

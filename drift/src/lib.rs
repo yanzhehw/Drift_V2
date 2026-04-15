@@ -40,6 +40,11 @@ static GUMDROP_PNG: &[u8] = include_bytes!("../colors/gumdrop.png");
 static SILVER_PNG: &[u8] = include_bytes!("../colors/silver.png");
 static FREEDOM_PNG: &[u8] = include_bytes!("../colors/freedom.png");
 
+// Note: we previously shared a single `wgpu::Instance` across all DriftHandles
+// via OnceLock. That caused intermittent multi-display rendering failures
+// (one monitor going black for certain presets). Each handle now owns its
+// own Instance — small extra cost, but reliable.
+
 /// Preset identifiers. Must stay in sync with the Objective-C side.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug)]
@@ -92,6 +97,7 @@ pub struct DriftHandle {
     flux: Flux,
     start: Instant,
     scale_factor: f32,
+    is_preview: bool,
 }
 
 impl DriftHandle {
@@ -101,9 +107,10 @@ impl DriftHandle {
         physical_height: u32,
         scale_factor: f32,
         preset: DriftPreset,
+        is_preview: bool,
     ) -> Result<Self, String> {
-        log_msg(&format!("DriftHandle::new size={}x{} scale={} preset={:?}",
-                         physical_width, physical_height, scale_factor, preset));
+        log_msg(&format!("DriftHandle::new size={}x{} scale={} preset={:?} preview={}",
+                         physical_width, physical_height, scale_factor, preset, is_preview));
         let instance = wgpu::Instance::default();
 
         let display_handle = RawDisplayHandle::AppKit(AppKitDisplayHandle::new());
@@ -153,12 +160,14 @@ impl DriftHandle {
         let height = physical_height.max(1);
         let sf = if scale_factor > 0.0 { scale_factor } else { 1.0 };
 
-        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            wgpu::PresentMode::Immediate
-        } else {
+        // Prefer Fifo (vsync, battery/CPU friendly) for a screensaver workload.
+        // Fall back to Mailbox/Immediate only if Fifo is unavailable.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
             wgpu::PresentMode::Fifo
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Immediate
         };
         log_msg(&format!("present_mode={:?}", present_mode));
 
@@ -175,7 +184,7 @@ impl DriftHandle {
         surface.configure(&device, &config);
         log_msg("surface configured OK");
 
-        let flux = Self::create_flux(&device, &queue, format, width, height, sf, preset)?;
+        let flux = Self::create_flux(&device, &queue, format, width, height, sf, preset, is_preview)?;
         log_msg("engine created OK");
 
         Ok(Self {
@@ -186,6 +195,7 @@ impl DriftHandle {
             flux,
             start: Instant::now(),
             scale_factor: sf,
+            is_preview,
         })
     }
 
@@ -197,15 +207,17 @@ impl DriftHandle {
         physical_height: u32,
         scale_factor: f32,
         preset: DriftPreset,
+        is_preview: bool,
     ) -> Result<Flux, String> {
         let logical_width = ((physical_width as f32) / scale_factor).round().max(1.0) as u32;
         let logical_height = ((physical_height as f32) / scale_factor).round().max(1.0) as u32;
 
-        let settings = Arc::new(Settings {
-            seed: Some("1337".into()),
-            color_mode: preset.color_mode(),
-            ..Default::default()
-        });
+        let settings = Arc::new(build_settings(
+            preset,
+            logical_width,
+            logical_height,
+            is_preview,
+        ));
 
         let mut flux = Flux::new(
             device, queue, format,
@@ -234,11 +246,17 @@ impl DriftHandle {
             &self.device, &self.queue,
             self.config.format,
             self.config.width, self.config.height,
-            self.scale_factor, preset,
+            self.scale_factor, preset, self.is_preview,
         ) {
             Ok(flux) => {
                 self.flux = flux;
                 self.start = Instant::now();
+                // Flush any queued texture/buffer writes (color texture upload,
+                // color buffer fill, line uniforms) so the very next animate()
+                // sees a fully-populated GPU state. Without this, the first
+                // frame after a preset change can sample an empty texture and
+                // the display gets stuck rendering nothing.
+                self.queue.submit(std::iter::empty());
             }
             Err(e) => {
                 eprintln!("drift-v2: apply_preset failed: {e}");
@@ -302,6 +320,44 @@ impl DriftHandle {
     }
 }
 
+/// Scale fluid grid resolution to the view size.
+///
+/// The default fluid_size=128 is tuned for full-screen rendering. For the
+/// System Settings thumbnail (~143x80) or other small views, a 128x128
+/// compute texture is wasted work — the simulation can't visibly use that
+/// much detail on so few pixels. Keep grid_spacing and view_scale at their
+/// defaults so the visual composition (line density and size) looks the
+/// same across scales.
+fn build_settings(
+    preset: DriftPreset,
+    logical_width: u32,
+    logical_height: u32,
+    is_preview: bool,
+) -> Settings {
+    let min_dim = logical_width.min(logical_height);
+
+    // fluid_size: simulation resolution. Cheaper on small views.
+    // view_scale: counteracts get_line_scale_factor() producing a large factor
+    //   on tiny views — without this, lines look over-sized ("zoomed in") on
+    //   the thumbnail. A smaller view_scale shrinks line_width + line_length
+    //   back toward the proportions seen at full-screen.
+    let (fluid_size, view_scale) = if is_preview || min_dim < 200 {
+        (48u32, 0.7f32) // thumbnail / tiny preview
+    } else if min_dim < 600 {
+        (80u32, 1.1f32) // small window preview
+    } else {
+        (128u32, 1.6f32) // default — full-screen / wallpaper mode
+    };
+
+    Settings {
+        seed: Some("1337".into()),
+        color_mode: preset.color_mode(),
+        fluid_size,
+        view_scale,
+        ..Default::default()
+    }
+}
+
 fn pick_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
     let preferred = [
         wgpu::TextureFormat::Bgra8Unorm,
@@ -326,14 +382,15 @@ pub unsafe extern "C" fn drift_create(
     physical_height: u32,
     scale_factor: f32,
     preset: u32,
+    is_preview: u32,
 ) -> *mut DriftHandle {
-    log_msg(&format!("drift_create called: view={:?} {}x{} scale={} preset={}",
-                     ns_view, physical_width, physical_height, scale_factor, preset));
+    log_msg(&format!("drift_create called: view={:?} {}x{} scale={} preset={} preview={}",
+                     ns_view, physical_width, physical_height, scale_factor, preset, is_preview));
     let Some(view) = NonNull::new(ns_view) else {
         log_msg("drift_create: NULL view!");
         return std::ptr::null_mut();
     };
-    match DriftHandle::new(view, physical_width, physical_height, scale_factor, DriftPreset::from_u32(preset)) {
+    match DriftHandle::new(view, physical_width, physical_height, scale_factor, DriftPreset::from_u32(preset), is_preview != 0) {
         Ok(h) => {
             log_msg("drift_create: success");
             Box::into_raw(Box::new(h))
