@@ -12,6 +12,10 @@ pub struct NoiseGenerator {
     scaling_ratio: grid::ScalingRatio,
 
     uniforms: NoiseUniforms,
+    // Set when `uniforms` changed and must be re-uploaded.
+    uniforms_dirty: bool,
+    // The timestep last written to `push_constants_buffer`.
+    uploaded_timestep: f32,
 
     channel_settings: Vec<settings::Noise>,
     channels: Vec<NoiseChannel>,
@@ -32,10 +36,7 @@ impl NoiseGenerator {
             return;
         }
 
-        let (width, height) = (
-            size * scaling_ratio.rounded_x(),
-            size * scaling_ratio.rounded_y(),
-        );
+        let (width, height) = scaling_ratio.scale(size);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -51,30 +52,40 @@ impl NoiseGenerator {
 
     pub fn update(&mut self, new_settings: &settings::Settings) {
         self.uniforms.multiplier = new_settings.noise_multiplier;
+        self.uniforms_dirty = true;
         self.channel_settings = new_settings.noise_channels.to_vec();
     }
 
     pub fn update_buffers(&mut self, queue: &wgpu::Queue, timestep: f32) {
         self.elapsed_time += timestep;
 
+        let scaling_ratio = self.scaling_ratio;
         self.channels
             .iter_mut()
             .zip(self.channel_settings.iter())
             .for_each(|(channel, channel_settings)| {
-                channel.tick(channel_settings, self.elapsed_time);
+                channel.tick(channel_settings, self.elapsed_time, scaling_ratio);
             });
 
-        queue.write_buffer(
-            &self.push_constants_buffer,
-            0,
-            bytemuck::cast_slice(&[0.0, 0.0, 0.0, timestep]),
-        );
+        // Every queue write allocates a staging buffer, so skip the ones whose
+        // contents haven't changed. The timestep is fixed in practice.
+        if timestep != self.uploaded_timestep {
+            queue.write_buffer(
+                &self.push_constants_buffer,
+                0,
+                bytemuck::cast_slice(&[0.0, 0.0, 0.0, timestep]),
+            );
+            self.uploaded_timestep = timestep;
+        }
 
-        queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[self.uniforms]),
-        );
+        if self.uniforms_dirty {
+            queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[self.uniforms]),
+            );
+            self.uniforms_dirty = false;
+        }
 
         queue.write_buffer(
             &self.channel_buffer,
@@ -83,7 +94,7 @@ impl NoiseGenerator {
         );
     }
 
-    pub fn generate<'cpass>(&'cpass self, cpass: &mut wgpu::ComputePass<'cpass>) {
+    pub fn generate(&self, cpass: &mut wgpu::ComputePass<'_>) {
         let workgroup = (
             self.texture.size().width / 16,
             self.texture.size().height / 16,
@@ -94,10 +105,10 @@ impl NoiseGenerator {
         cpass.dispatch_workgroups(workgroup.0, workgroup.1, workgroup.2);
     }
 
-    pub fn inject_noise_into<'cpass>(
-        &'cpass self,
-        cpass: &mut wgpu::ComputePass<'cpass>,
-        target_texture_bind_group: &'cpass wgpu::BindGroup,
+    pub fn inject_noise_into(
+        &self,
+        cpass: &mut wgpu::ComputePass<'_>,
+        target_texture_bind_group: &wgpu::BindGroup,
         target_texture_size: wgpu::Extent3d,
     ) {
         let workgroup = (
@@ -154,10 +165,7 @@ impl NoiseGeneratorBuilder {
             .map(|channel| NoiseChannel::new(self.scaling_ratio, channel))
             .collect::<Vec<_>>();
 
-        let (width, height) = (
-            self.size * self.scaling_ratio.rounded_x(),
-            self.size * self.scaling_ratio.rounded_y(),
-        );
+        let (width, height) = self.scaling_ratio.scale(self.size);
 
         let size = wgpu::Extent3d {
             width,
@@ -434,6 +442,8 @@ impl NoiseGeneratorBuilder {
             elapsed_time: 0.0,
 
             uniforms,
+            uniforms_dirty: false,
+            uploaded_timestep: 0.0,
             channel_settings: self.channels,
             channels,
 
@@ -507,10 +517,17 @@ impl NoiseChannel {
         }
     }
 
-    pub fn tick(&mut self, channel_settings: &settings::Noise, elapsed_time: f32) {
+    pub fn tick(
+        &mut self,
+        channel_settings: &settings::Noise,
+        elapsed_time: f32,
+        scaling_ratio: grid::ScalingRatio,
+    ) {
         let scale = channel_settings.scale
             * (1.0 + 0.15 * (0.01 * elapsed_time * std::f32::consts::TAU).sin());
-        self.scale = [scale, scale];
+        // Scale per axis so noise features are round and the same logical
+        // size on every screen.
+        self.scale = [scale * scaling_ratio.x(), scale * scaling_ratio.y()];
         self.multiplier = channel_settings.multiplier;
         self.offset_1 += channel_settings.offset_increment;
 

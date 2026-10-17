@@ -3,7 +3,7 @@
 # Drift_V2 Screensaver Installer for macOS
 #
 # One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/yanzhehw/drift-screensaver/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/yanzhehw/Drift_V2/main/install.sh | bash
 #
 # Or from a cloned repo:
 #   ./install.sh
@@ -54,7 +54,7 @@ else
     # Running via curl | bash — clone to a temp directory
     step "Cloning repository..."
     CLONED_TMPDIR="$(mktemp -d)"
-    git clone --depth 1 https://github.com/yanzhehw/drift-screensaver.git "$CLONED_TMPDIR" 2>&1 | tail -1
+    git clone --depth 1 https://github.com/yanzhehw/Drift_V2.git "$CLONED_TMPDIR" 2>&1 | tail -1
     ROOT_DIR="$CLONED_TMPDIR"
 fi
 

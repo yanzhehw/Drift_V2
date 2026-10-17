@@ -45,6 +45,47 @@ impl FluidUniforms {
     }
 }
 
+/// A buffer laid out like a pressure texture and filled with the clear value.
+/// Copying from it resets the pressure on the GPU without a per-frame upload.
+struct PressureClear {
+    value: f32,
+    buffer: wgpu::Buffer,
+    bytes_per_row: u32,
+}
+
+impl PressureClear {
+    fn new(device: &wgpu::Device, size: wgpu::Extent3d, value: f32) -> Self {
+        let bytes_per_row = (4 * size.width).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let contents = vec![value; (bytes_per_row / 4 * size.height) as usize];
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("buffer:pressure_clear"),
+            contents: bytemuck::cast_slice(&contents),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+
+        Self {
+            value,
+            buffer,
+            bytes_per_row,
+        }
+    }
+
+    fn for_mode(
+        device: &wgpu::Device,
+        size: wgpu::Extent3d,
+        mode: settings::PressureMode,
+        current: Option<Self>,
+    ) -> Option<Self> {
+        match mode {
+            settings::PressureMode::ClearWith(value) => match current {
+                Some(clear) if clear.value == value => Some(clear),
+                _ => Some(Self::new(device, size, value)),
+            },
+            settings::PressureMode::Retain => None,
+        }
+    }
+}
+
 pub struct Context {
     fluid_size: [f32; 2],
     fluid_size_3d: wgpu::Extent3d,
@@ -52,6 +93,7 @@ pub struct Context {
     diffusion_iterations: u32,
     pressure_mode: settings::PressureMode,
     pressure_iterations: u32,
+    pressure_clear: Option<PressureClear>,
 
     fluid_uniforms: FluidUniforms,
     fluid_uniform_buffer: wgpu::Buffer,
@@ -93,15 +135,12 @@ pub struct Context {
 impl Context {
     pub fn update(
         &mut self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         scaling_ratio: grid::ScalingRatio,
         settings: &Arc<Settings>,
     ) {
-        let (width, height) = (
-            scaling_ratio.rounded_x() * settings.fluid_size,
-            scaling_ratio.rounded_y() * settings.fluid_size,
-        );
+        let (width, height) = scaling_ratio.scale(settings.fluid_size);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -119,6 +158,12 @@ impl Context {
         self.diffusion_iterations = settings.diffusion_iterations;
         self.pressure_mode = settings.pressure_mode;
         self.pressure_iterations = settings.pressure_iterations;
+        self.pressure_clear = PressureClear::for_mode(
+            device,
+            self.fluid_size_3d,
+            self.pressure_mode,
+            self.pressure_clear.take(),
+        );
 
         // Update uniforms
         self.fluid_uniforms = FluidUniforms::new(&size, settings);
@@ -135,10 +180,7 @@ impl Context {
         scaling_ratio: grid::ScalingRatio,
         settings: &Arc<Settings>,
     ) -> Self {
-        let (width, height) = (
-            scaling_ratio.rounded_x() * settings.fluid_size,
-            scaling_ratio.rounded_y() * settings.fluid_size,
-        );
+        let (width, height) = scaling_ratio.scale(settings.fluid_size);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -882,6 +924,7 @@ impl Context {
             diffusion_iterations: settings.diffusion_iterations,
             pressure_mode: settings.pressure_mode,
             pressure_iterations: settings.pressure_iterations,
+            pressure_clear: PressureClear::for_mode(device, size, settings.pressure_mode, None),
 
             fluid_uniforms,
             fluid_uniform_buffer,
@@ -930,11 +973,7 @@ impl Context {
         )
     }
 
-    pub fn advect_forward<'cpass>(
-        &'cpass self,
-        _queue: &wgpu::Queue,
-        cpass: &mut wgpu::ComputePass<'cpass>,
-    ) {
+    pub fn advect_forward(&self, _queue: &wgpu::Queue, cpass: &mut wgpu::ComputePass<'_>) {
         let velocity_index = self.last_velocity_index.lock().unwrap();
         let workgroup = self.get_workgroup_size();
         cpass.set_pipeline(&self.advection_pipeline);
@@ -945,11 +984,7 @@ impl Context {
         cpass.dispatch_workgroups(workgroup.0, workgroup.1, workgroup.2);
     }
 
-    pub fn advect_reverse<'cpass>(
-        &'cpass self,
-        _queue: &wgpu::Queue,
-        cpass: &mut wgpu::ComputePass<'cpass>,
-    ) {
+    pub fn advect_reverse(&self, _queue: &wgpu::Queue, cpass: &mut wgpu::ComputePass<'_>) {
         let workgroup = self.get_workgroup_size();
         cpass.set_pipeline(&self.advection_pipeline);
         cpass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -960,7 +995,7 @@ impl Context {
         cpass.dispatch_workgroups(workgroup.0, workgroup.1, workgroup.2);
     }
 
-    pub fn adjust_advection<'cpass>(&'cpass self, cpass: &mut wgpu::ComputePass<'cpass>) {
+    pub fn adjust_advection(&self, cpass: &mut wgpu::ComputePass<'_>) {
         let mut velocity_index = self.last_velocity_index.lock().unwrap();
         let workgroup = self.get_workgroup_size();
         cpass.set_pipeline(&self.adjust_advection_pipeline);
@@ -972,7 +1007,7 @@ impl Context {
         *velocity_index = 1 - *velocity_index;
     }
 
-    pub fn diffuse<'cpass>(&'cpass self, cpass: &mut wgpu::ComputePass<'cpass>) {
+    pub fn diffuse(&self, cpass: &mut wgpu::ComputePass<'_>) {
         let mut velocity_index = self.last_velocity_index.lock().unwrap();
         let workgroup = self.get_workgroup_size();
         cpass.set_pipeline(&self.diffusion_pipeline);
@@ -985,7 +1020,7 @@ impl Context {
         }
     }
 
-    pub fn calculate_divergence<'cpass>(&'cpass self, cpass: &mut wgpu::ComputePass<'cpass>) {
+    pub fn calculate_divergence(&self, cpass: &mut wgpu::ComputePass<'_>) {
         let velocity_index = self.last_velocity_index.lock().unwrap();
         let workgroup = self.get_workgroup_size();
         cpass.set_pipeline(&self.divergence_pipeline);
@@ -994,41 +1029,38 @@ impl Context {
         cpass.dispatch_workgroups(workgroup.0, workgroup.1, workgroup.2);
     }
 
-    pub fn clear_pressure(&self, queue: &wgpu::Queue, pressure: f32) {
-        let (width, height) = (self.fluid_size[0] as u32, self.fluid_size[1] as u32);
+    /// Reset the pressure field before solving, if the pressure mode asks for it.
+    ///
+    /// Must be called outside of a compute pass. The reset is a GPU-side copy:
+    /// a per-frame queue upload would allocate a fresh staging buffer each time
+    /// (a kernel round-trip on Metal).
+    pub fn clear_pressure(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(clear) = &self.pressure_clear else {
+            return;
+        };
 
         for pressure_texture in self.pressure_textures.iter() {
-            queue.write_texture(
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &clear.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(clear.bytes_per_row),
+                        rows_per_image: Some(self.fluid_size_3d.height),
+                    },
+                },
                 wgpu::TexelCopyTextureInfo {
                     texture: pressure_texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                bytemuck::cast_slice(&vec![pressure; (width * height) as usize]),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
                 self.fluid_size_3d,
             );
         }
     }
 
-    pub fn solve_pressure<'cpass>(
-        &'cpass self,
-        queue: &wgpu::Queue,
-        cpass: &mut wgpu::ComputePass<'cpass>,
-    ) {
-        use settings::PressureMode::*;
-        match self.pressure_mode {
-            ClearWith(pressure) => {
-                self.clear_pressure(queue, pressure);
-            }
-            Retain => (),
-        }
-
+    pub fn solve_pressure(&self, cpass: &mut wgpu::ComputePass<'_>) {
         let mut pressure_index = self.last_pressure_index.lock().unwrap();
         let workgroup = self.get_workgroup_size();
         cpass.set_pipeline(&self.pressure_pipeline);
@@ -1042,7 +1074,7 @@ impl Context {
         }
     }
 
-    pub fn subtract_gradient<'cpass>(&'cpass self, cpass: &mut wgpu::ComputePass<'cpass>) {
+    pub fn subtract_gradient(&self, cpass: &mut wgpu::ComputePass<'_>) {
         let pressure_index = self.last_pressure_index.lock().unwrap();
         let mut velocity_index = self.last_velocity_index.lock().unwrap();
         let workgroup = self.get_workgroup_size();

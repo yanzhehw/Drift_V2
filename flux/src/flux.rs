@@ -216,15 +216,31 @@ impl Flux {
             self.elapsed_time = timer_overflow;
         }
 
-        while self.fluid_frame_time >= self.settings.fluid_timestep {
-            self.noise_generator
-                .update_buffers(queue, self.settings.fluid_timestep);
+        let fluid_timestep = self.settings.fluid_timestep;
+        let mut fluid_steps = 0;
+        while self.fluid_frame_time >= fluid_timestep {
+            self.fluid_frame_time -= fluid_timestep;
+            fluid_steps += 1;
+        }
 
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("flux::compute"),
-                timestamp_writes: None,
-            });
+        // Reset the pressure once per frame, ahead of all steps. (It was reset
+        // by queue uploads, which always land before the frame's commands, so
+        // the steps within a frame have always shared a single reset.)
+        if fluid_steps > 0 {
+            self.fluid.clear_pressure(encoder);
+        }
 
+        self.lines
+            .tick_line_uniforms(device, queue, timestep, self.elapsed_time);
+
+        // One compute pass for all fluid steps and the line placement.
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("flux::compute"),
+            timestamp_writes: None,
+        });
+
+        for _ in 0..fluid_steps {
+            self.noise_generator.update_buffers(queue, fluid_timestep);
             self.noise_generator.generate(&mut cpass);
 
             self.fluid.advect_forward(queue, &mut cpass);
@@ -240,34 +256,29 @@ impl Flux {
             );
 
             self.fluid.calculate_divergence(&mut cpass);
-            self.fluid.solve_pressure(queue, &mut cpass);
+            self.fluid.solve_pressure(&mut cpass);
             self.fluid.subtract_gradient(&mut cpass);
-
-            self.fluid_frame_time -= self.settings.fluid_timestep;
         }
 
-        {
-            self.lines
-                .tick_line_uniforms(device, queue, timestep, self.elapsed_time);
-
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("flux::place_lines"),
-                timestamp_writes: None,
-            });
-
-            self.lines
-                .place_lines(&mut cpass, self.fluid.get_read_velocity_bind_group());
-        }
+        self.lines
+            .place_lines(&mut cpass, self.fluid.get_read_velocity_bind_group());
     }
 
     pub fn render(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         screen_viewport: Option<render::ScreenViewport>,
     ) {
+        if self.settings.mode == settings::Mode::Normal {
+            let view_transform = screen_viewport
+                .map(|ref sv| render::ViewTransform::from_screen_viewport(&self.physical_size, sv))
+                .unwrap_or_default();
+            self.lines.set_view_transform(queue, view_transform);
+        }
+
         encoder.push_debug_group("render lines");
 
         {
@@ -291,12 +302,6 @@ impl Flux {
             use settings::Mode::*;
             match &self.settings.mode {
                 Normal => {
-                    let view_transform = screen_viewport
-                        .map(|ref sv| {
-                            render::ViewTransform::from_screen_viewport(&self.physical_size, sv)
-                        })
-                        .unwrap_or_default();
-                    self.lines.set_view_transform(queue, view_transform);
                     self.lines.draw_lines(&mut rpass);
                     self.lines.draw_endpoints(&mut rpass);
                 }

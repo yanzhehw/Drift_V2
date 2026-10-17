@@ -1,3 +1,10 @@
+/// The size of the simulation domain relative to a reference size, per axis.
+///
+/// The fluid grid, the noise and the per-line noise are all scaled by this, so
+/// a fluid cell and a noise feature cover the same logical area on every
+/// screen and stay square whatever its shape or orientation. (A fixed-size
+/// square grid stretched over the screen made the flow run sideways on
+/// landscape screens and vertically on portrait ones.)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScalingRatio {
     x: f32,
@@ -5,10 +12,15 @@ pub struct ScalingRatio {
 }
 
 impl ScalingRatio {
-    pub fn new(columns: u32, rows: u32) -> Self {
-        let x = (columns as f32 / 171.0).max(1.0);
-        let y = (rows as f32 / 171.0).max(1.0);
-        Self { x, y }
+    /// The logical size at which the ratio is 1: the geometric mean of a
+    /// 2560×1440 screen, so that size keeps the original fluid cell area.
+    const REFERENCE_SIZE: f32 = 1920.0;
+
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            x: width as f32 / Self::REFERENCE_SIZE,
+            y: height as f32 / Self::REFERENCE_SIZE,
+        }
     }
 
     pub fn x(&self) -> f32 {
@@ -19,12 +31,11 @@ impl ScalingRatio {
         self.y
     }
 
-    pub fn rounded_x(&self) -> u32 {
-        self.x.round() as u32
-    }
-
-    pub fn rounded_y(&self) -> u32 {
-        self.y.round() as u32
+    /// `base` scaled per axis and rounded to a multiple of 16, the compute
+    /// workgroup size.
+    pub fn scale(&self, base: u32) -> (u32, u32) {
+        let scale_axis = |ratio: f32| (base as f32 * ratio / 16.0).round().max(1.0) as u32 * 16;
+        (scale_axis(self.x), scale_axis(self.y))
     }
 }
 
@@ -54,7 +65,7 @@ impl Grid {
         let columns = columns as u32 + 1;
         let rows = rows as u32 + 1;
         let line_count = rows * columns;
-        let scaling_ratio = ScalingRatio::new(columns, rows);
+        let scaling_ratio = ScalingRatio::new(uwidth, uheight);
 
         let mut basepoints = Vec::with_capacity(2 * line_count as usize);
 

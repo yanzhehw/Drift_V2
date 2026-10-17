@@ -44,8 +44,9 @@ Drift_V2/
 1. macOS loads `Drift_V2.saver` bundle. `NSPrincipalClass` = `DriftV2ScreenSaverView`.
 2. `DriftV2ScreenSaverView` (Obj-C) creates a `CAMetalLayer`, then calls `drift_create()` (Rust FFI) with the saved preset.
 3. `drift_create` → `DriftHandle::new` → builds wgpu device, surface, and `Flux` engine.
-4. `animateOneFrame` (60 Hz) → `drift_animate` → `Flux::animate` → compute + render passes.
-5. User clicks Options → `configureSheet` → popup menu → `drift_set_preset` → `DriftHandle::apply_preset` rebuilds Flux with new color mode.
+4. `animateOneFrame` → `drift_animate` → `Flux::animate` → one compute pass (fluid steps + line placement) + one render pass. The timer runs at 60 Hz, 30 Hz with the reduced frame rate (Options, or Auto in Low Power Mode / thermal pressure), and a 1 Hz idle tick while hidden (window occluded, displays asleep, user switched away).
+5. User clicks Options → `configureSheet` → color scheme + frame rate popups → `drift_set_preset` → `DriftHandle::apply_preset` rebuilds Flux with the new color mode (no-op if unchanged).
+6. Screen saver dismissed → `com.apple.screensaver.willstop` → the view stops itself and frees the engine; inside `legacyScreenSaver` on macOS 14+ the process then exits after 1 s.
 
 ## Key Files to Know
 
@@ -79,4 +80,8 @@ Rust side writes to `/tmp/drift-v2-screensaver.log` (see `log_msg` in [drift/src
 - `ScreenSaverDefaults` stores per-module prefs; the module name `com.local.DriftV2ScreenSaver` must match `CFBundleIdentifier` in `Info.plist`.
 - `Flux::new` does not read `self.settings.color_mode` for texture bindings — image presets require a separate `sample_colors_from_image` call after construction (done in `DriftHandle::create_flux`).
 - `lines::Context::update` is called on resize. It recreates `LineUniforms` from `settings.color_mode`, so keep `settings.color_mode` truthful (this is why `EmbeddedImage` exists — it correctly yields shader mode 2).
+- On macOS 14+ `legacyScreenSaver` often never calls `-stopAnimation` and keeps every view it created alive after the screen saver ends. Don't rely on `-stopAnimation`; the `willstop` handler is what tears things down.
+- The scale factor passed to `drift_create`/`drift_resize` is device pixels per *reference pixel* (110 ppi), computed from the screen's physical size in `-engineScaleFactor`, not the backing scale factor. With `grid::ScalingRatio` (domain size relative to 1920 logical units, per axis) and an aspect-independent `get_line_scale_factor`, lines, spacing and fluid cells are the same physical size and square on every display, including portrait ones.
+- `Flux::resize` is only a partial rebuild (fluid grid keeps its size, the noise generator keeps writing to its old texture). `DriftHandle::resize` rebuilds the whole engine instead.
+- In wgpu 28 every `queue.write_buffer` / `write_texture` allocates a fresh staging buffer (a kernel call on Metal). Don't upload unchanged data per frame; GPU-side copies (see `fluid::PressureClear`) are free of that. `encoder.clear_texture` needs `Features::CLEAR_TEXTURE`, which the device doesn't request.
 - Virtual-memory size for the screensaver process looks huge (hundreds of GB) — that's Metal/wgpu address-space reservation, not RAM. Use Real Memory Size instead.

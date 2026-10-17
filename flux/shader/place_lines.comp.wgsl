@@ -162,8 +162,14 @@ fn main(
 
     // Color wheel
     case 1u: {
-      let angle = atan2(velocity.y, velocity.x);
-      color = get_color(angle + pi, tau).rgb;
+      // atan2(0, 0) is NaN on Metal, and a NaN never leaves color_velocity,
+      // so the line stays black for good. The fluid is still at rest on a
+      // frame placed before its first step: hold the color until it moves.
+      color = line.color.rgb;
+      if (max(abs(velocity.x), abs(velocity.y)) > 1e-6) {
+        let angle = atan2(velocity.y, velocity.x);
+        color = get_color(angle + pi, tau).rgb;
+      }
       // Using the velocity length instead of the angle
       // color = get_color(2.0 * length(velocity), 1.3).rgb;
     }

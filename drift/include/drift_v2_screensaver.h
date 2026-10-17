@@ -14,9 +14,19 @@ typedef enum {
     DriftPresetGumdrop   = 3,
     DriftPresetSilver    = 4,
     DriftPresetFreedom   = 5,
+    DriftPresetSpaceGray = 6,
+    DriftPresetAurora    = 7,
+    DriftPresetAtlas     = 8,
+    DriftPresetEmerald   = 9,
+    DriftPresetGlacier   = 10,
+    DriftPresetEmber     = 11,
 } DriftPreset;
 
 typedef struct DriftHandle DriftHandle;
+
+/* `scale_factor` is device pixels per logical unit. The engine's sizes (line
+ * width and spacing, flow features) are in logical units, so the caller picks
+ * this to make a logical unit the same physical size on every display. */
 
 DriftHandle *drift_create(void *ns_view,
                            uint32_t physical_width,

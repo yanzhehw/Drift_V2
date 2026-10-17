@@ -1,22 +1,74 @@
 #import "DriftV2ScreenSaverView.h"
 #import "drift_v2_screensaver.h"
-#import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 static NSString *const kDriftModuleName = @"com.local.DriftV2ScreenSaver";
 static NSString *const kPresetKey       = @"DriftPreset";
+static NSString *const kFrameRateKey    = @"DriftFrameRate";
+
+// Posted by the system when the screen saver is dismissed.
+static NSString *const kScreenSaverWillStopNotification = @"com.apple.screensaver.willstop";
+
+// Bundle identifier prefix of the process that hosts third-party screen savers
+// on modern macOS (an arm64 and an x86-64 variant exist).
+static NSString *const kLegacyScreenSaverHostPrefix = @"com.apple.ScreenSaver.Engine.legacyScreenSaver";
+
+// Animation timer intervals. ScreenSaverView applies a new interval to the
+// running timer immediately, so these switch cleanly between states.
+static const NSTimeInterval kActiveFrameInterval  = 1.0 / 60.0;
+static const NSTimeInterval kReducedFrameInterval = 1.0 / 30.0;
+static const NSTimeInterval kHiddenTickInterval   = 1.0;   // nothing to draw; just stay alive
+static const NSTimeInterval kPreviewTickInterval  = 60.0;  // preview is a static image
+
+// How often to re-read preferences (preset, frame rate) and power state.
+static const CFTimeInterval kSettingsPollInterval = 2.0;
+
+// Delay between the screen saver stopping and the host process exiting.
+static const NSTimeInterval kHostExitDelay = 1.0;
+
+// Line size, line spacing and flow features are tuned for 110 pixels per inch
+// (a 27-inch 1440p display). The engine is told how many device pixels make
+// up one such reference pixel on the current screen, so everything comes out
+// the same physical size on every display.
+static const CGFloat kReferencePixelsPerMM = 110.0 / 25.4;
+
+typedef NS_ENUM(NSInteger, DriftFrameRate) {
+    DriftFrameRateAuto = 0,  // 60 fps; 30 fps in Low Power Mode or under thermal pressure
+    DriftFrameRate60   = 1,
+    DriftFrameRate30   = 2,
+};
 
 #define DLOG(fmt, ...) NSLog(@"[Drift_V2] " fmt, ##__VA_ARGS__)
+
+// Bumped by every startAnimation; a pending host exit only fires if no
+// screen saver started in this process since it was scheduled.
+static NSUInteger gHostExitGeneration;
+// Preview views currently animating in this process (System Settings).
+static NSInteger gAnimatingPreviewCount;
+
+static BOOL DriftHostIsLegacyScreenSaver(void) {
+    return [NSBundle.mainBundle.bundleIdentifier hasPrefix:kLegacyScreenSaverHostPrefix];
+}
 
 @interface DriftV2ScreenSaverView () {
     DriftHandle *_drift;
     BOOL _isPreview;
-    BOOL _isOccluded;       // Set via explicit occlusion-change notification only.
-    uint32_t _currentPreset; // Last preset applied to _drift.
-    NSInteger _pollCounter;  // Frame counter for periodic defaults re-check.
+    BOOL _countedAsAnimatingPreview;  // Included in gAnimatingPreviewCount.
+    uint32_t _currentPreset;    // Last preset applied to _drift.
+    DriftFrameRate _frameRate;  // Saved frame-rate preference.
+
+    // Reasons not to render. Each is set only by an explicit signal: a
+    // transiently-zero occlusionState during window setup/teardown must not
+    // stop rendering (that was the cause of the black-screen bug).
+    BOOL _windowOccluded;
+    BOOL _screensAsleep;
+    BOOL _sessionInactive;
+
+    CFTimeInterval _nextSettingsPoll;
 }
 @property (nonatomic, strong) NSWindow *configSheet;
 @property (nonatomic, strong) NSPopUpButton *presetPopup;
+@property (nonatomic, strong) NSPopUpButton *frameRatePopup;
 @end
 
 @implementation DriftV2ScreenSaverView
@@ -47,11 +99,13 @@ static NSString *const kPresetKey       = @"DriftPreset";
         return layer;
     }
 
+    // No device here: wgpu assigns the one it picked (the low-power GPU)
+    // when it configures the surface. MTLCreateSystemDefaultDevice() would
+    // power up the discrete GPU on dual-GPU Macs.
     CAMetalLayer *layer = [CAMetalLayer layer];
-    layer.device = MTLCreateSystemDefaultDevice();
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
-    DLOG(@"makeBackingLayer: %@ device=%@", layer, layer.device);
+    DLOG(@"makeBackingLayer: %@", layer);
     return layer;
 }
 
@@ -62,9 +116,12 @@ static NSString *const kPresetKey       = @"DriftPreset";
     self = [super initWithFrame:frame isPreview:isPreview];
     if (self) {
         _isPreview = isPreview;
-        // Thumbnails/previews animate at 20 Hz — plenty smooth, ~3x less work.
-        [self setAnimationTimeInterval:(isPreview ? (1.0 / 20.0) : (1.0 / 60.0))];
+        _frameRate = [self savedFrameRate];
+        [self setAnimationTimeInterval:(isPreview ? kPreviewTickInterval : kActiveFrameInterval)];
         [self setWantsLayer:YES];
+        if (!isPreview) {
+            [self registerForSystemNotifications];
+        }
         DLOG(@"init done, layer=%@ class=%@", self.layer, [self.layer class]);
     }
     return self;
@@ -72,67 +129,172 @@ static NSString *const kPresetKey       = @"DriftPreset";
 
 - (void)dealloc {
     DLOG(@"dealloc");
+    [self setCountedAsAnimatingPreview:NO];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [[NSDistributedNotificationCenter defaultCenter] removeObserver:self];
+    [[NSWorkspace sharedWorkspace].notificationCenter removeObserver:self];
     if (_drift) {
         drift_destroy(_drift);
         _drift = NULL;
     }
 }
 
-#pragma mark - Preferences
+- (void)registerForSystemNotifications {
+    // On macOS 14+ the host frequently never calls -stopAnimation when the
+    // screen saver is dismissed, so the view (and its 60 Hz render loop)
+    // lives on in the background. This notification is the reliable signal.
+    [[NSDistributedNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(screenSaverWillStop:)
+               name:kScreenSaverWillStopNotification
+             object:nil];
 
-- (uint32_t)savedPreset {
-    ScreenSaverDefaults *defaults = [ScreenSaverDefaults defaultsForModuleWithName:kDriftModuleName];
-    [defaults registerDefaults:@{ kPresetKey: @(DriftPresetOriginal) }];
-    return (uint32_t)[defaults integerForKey:kPresetKey];
+    NSNotificationCenter *workspace = [NSWorkspace sharedWorkspace].notificationCenter;
+    [workspace addObserver:self selector:@selector(screensDidSleep:)
+                      name:NSWorkspaceScreensDidSleepNotification object:nil];
+    [workspace addObserver:self selector:@selector(screensDidWake:)
+                      name:NSWorkspaceScreensDidWakeNotification object:nil];
+    [workspace addObserver:self selector:@selector(sessionDidResignActive:)
+                      name:NSWorkspaceSessionDidResignActiveNotification object:nil];
+    [workspace addObserver:self selector:@selector(sessionDidBecomeActive:)
+                      name:NSWorkspaceSessionDidBecomeActiveNotification object:nil];
 }
 
-- (void)savePreset:(uint32_t)preset {
+- (void)setCountedAsAnimatingPreview:(BOOL)counted {
+    if (counted == _countedAsAnimatingPreview) return;
+    _countedAsAnimatingPreview = counted;
+    gAnimatingPreviewCount += counted ? 1 : -1;
+}
+
+#pragma mark - Preferences
+
+- (ScreenSaverDefaults *)defaults {
     ScreenSaverDefaults *defaults = [ScreenSaverDefaults defaultsForModuleWithName:kDriftModuleName];
+    [defaults registerDefaults:@{
+        kPresetKey: @(DriftPresetOriginal),
+        kFrameRateKey: @(DriftFrameRateAuto),
+    }];
+    return defaults;
+}
+
+- (uint32_t)savedPreset {
+    return (uint32_t)[[self defaults] integerForKey:kPresetKey];
+}
+
+- (DriftFrameRate)savedFrameRate {
+    return (DriftFrameRate)[[self defaults] integerForKey:kFrameRateKey];
+}
+
+- (void)savePreset:(uint32_t)preset frameRate:(DriftFrameRate)frameRate {
+    ScreenSaverDefaults *defaults = [self defaults];
     [defaults setInteger:preset forKey:kPresetKey];
+    [defaults setInteger:frameRate forKey:kFrameRateKey];
     [defaults synchronize];
+}
+
+#pragma mark - Render state
+
+- (BOOL)shouldRender {
+    return !_windowOccluded && !_screensAsleep && !_sessionInactive;
+}
+
+- (BOOL)wantsReducedFrameRate {
+    switch (_frameRate) {
+        case DriftFrameRate60: return NO;
+        case DriftFrameRate30: return YES;
+        case DriftFrameRateAuto:
+        default: {
+            NSProcessInfo *info = [NSProcessInfo processInfo];
+            if (@available(macOS 12.0, *)) {
+                if (info.isLowPowerModeEnabled) return YES;
+            }
+            return info.thermalState >= NSProcessInfoThermalStateSerious;
+        }
+    }
+}
+
+// Match the timer to what's on screen: full rate while visible, a slow idle
+// tick while hidden, so a paused saver doesn't wake the CPU 60 times a second.
+- (void)updateAnimationInterval {
+    if (_isPreview) return;
+
+    NSTimeInterval interval;
+    if (![self shouldRender]) {
+        interval = kHiddenTickInterval;
+    } else if ([self wantsReducedFrameRate]) {
+        interval = kReducedFrameInterval;
+    } else {
+        interval = kActiveFrameInterval;
+    }
+
+    if (fabs(self.animationTimeInterval - interval) > 1e-6) {
+        DLOG(@"animation interval %.4f -> %.4f", self.animationTimeInterval, interval);
+        [self setAnimationTimeInterval:interval];
+    }
+}
+
+// Re-reads preferences, which the Options sheet may have changed from another
+// process (each display can be its own process). Returns YES if the engine
+// was rebuilt for a new preset.
+- (BOOL)pollSettings {
+    ScreenSaverDefaults *defaults = [self defaults];
+    [defaults synchronize];
+
+    _frameRate = (DriftFrameRate)[defaults integerForKey:kFrameRateKey];
+    [self updateAnimationInterval];
+
+    uint32_t newPreset = (uint32_t)[defaults integerForKey:kPresetKey];
+    if (newPreset != _currentPreset && _drift) {
+        DLOG(@"poll: preset changed %u → %u, applying", _currentPreset, newPreset);
+        _currentPreset = newPreset;
+        drift_set_preset(_drift, newPreset);
+        return YES;
+    }
+    return NO;
 }
 
 #pragma mark - ScreenSaverView
 
+- (void)createEngineIfNeeded {
+    if (_drift) return;
+
+    [self syncDrawableSize];
+    NSSize px = [self convertSizeToBacking:self.bounds.size];
+    CGFloat scale = [self engineScaleFactor];
+
+    uint32_t preset = [self savedPreset];
+    _currentPreset = preset;
+    DLOG(@"drift_create: px=%.0fx%.0f scale=%.3f preset=%u",
+         px.width, px.height, scale, preset);
+    _drift = drift_create((__bridge void *)self,
+                          (uint32_t)px.width,
+                          (uint32_t)px.height,
+                          (float)scale,
+                          preset,
+                          0u);
+    DLOG(@"drift_create returned: %p", _drift);
+}
+
 - (void)startAnimation {
     DLOG(@"startAnimation, bounds=%@, layer=%@ class=%@",
          NSStringFromRect(self.bounds), self.layer, [self.layer class]);
+    // A screen saver is (re)starting in this process: cancel any pending exit.
+    gHostExitGeneration++;
+    if (_isPreview) [self setCountedAsAnimatingPreview:YES];
+
     [super startAnimation];
 
     // Preview mode shows the static thumbnail — no engine, no animation.
     if (_isPreview) return;
 
-    if (!_drift) {
-        NSSize px = [self convertSizeToBacking:self.bounds.size];
-        CGFloat scale = self.window ? self.window.backingScaleFactor : 2.0;
-
-        CALayer *layer = self.layer;
-        if ([layer isKindOfClass:[CAMetalLayer class]]) {
-            CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
-            metalLayer.contentsScale = scale;
-            metalLayer.drawableSize = CGSizeMake(px.width, px.height);
-            DLOG(@"Metal layer drawableSize=%.0fx%.0f", px.width, px.height);
-        } else {
-            DLOG(@"WARNING: layer is NOT CAMetalLayer: %@", [layer class]);
-        }
-
-        uint32_t preset = [self savedPreset];
-        _currentPreset = preset;
-        DLOG(@"drift_create: px=%.0fx%.0f scale=%.1f preset=%u preview=%d",
-             px.width, px.height, scale, preset, _isPreview);
-        _drift = drift_create((__bridge void *)self,
-                              (uint32_t)px.width,
-                              (uint32_t)px.height,
-                              (float)scale,
-                              preset,
-                              _isPreview ? 1u : 0u);
-        DLOG(@"drift_create returned: %p", _drift);
-    }
+    [self createEngineIfNeeded];
+    _nextSettingsPoll = CACurrentMediaTime() + kSettingsPollInterval;
+    [self updateAnimationInterval];
 }
 
 - (void)stopAnimation {
     DLOG(@"stopAnimation");
+    [self setCountedAsAnimatingPreview:NO];
     [super stopAnimation];
     if (_drift) {
         drift_destroy(_drift);
@@ -147,87 +309,158 @@ static NSString *const kPresetKey       = @"DriftPreset";
 - (void)animateOneFrame {
     if (_isPreview) return;  // preview shows the static thumbnail
     if (!_drift) return;
+    if (![self shouldRender]) return;
 
-    // Periodically (~every 1s at 60 Hz) re-read the saved preset from
-    // ScreenSaverDefaults and apply it if it changed. This is the simplest
-    // reliable way to propagate preset changes from the Settings sheet
-    // (different process) to the wallpaper renderer — no IPC, no Darwin
-    // notifications, just polling. Cost is one defaults-read per second.
-    if (++_pollCounter >= 60) {
-        _pollCounter = 0;
-        ScreenSaverDefaults *defaults =
-            [ScreenSaverDefaults defaultsForModuleWithName:kDriftModuleName];
-        [defaults synchronize];
-        uint32_t newPreset = (uint32_t)[defaults integerForKey:kPresetKey];
-        if (newPreset != _currentPreset) {
-            DLOG(@"poll: preset changed %u → %u, applying",
-                 _currentPreset, newPreset);
-            _currentPreset = newPreset;
-            drift_set_preset(_drift, newPreset);
-            // Skip rendering this tick — give the GPU a clean breath after
-            // rebuilding the engine. Next tick (~16ms later) will render with
-            // the new preset's textures fully resident.
-            return;
-        }
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now >= _nextSettingsPoll) {
+        _nextSettingsPoll = now + kSettingsPollInterval;
+        // Skip rendering on the tick that rebuilt the engine; the next one
+        // renders with the new preset's resources in place.
+        if ([self pollSettings]) return;
     }
-
-    // In wallpaper mode, skip rendering when we've been explicitly told the
-    // window is occluded. Only act on a *positive* occlusion signal — a
-    // transiently-zero occlusionState during window setup/teardown should NOT
-    // cause us to stop rendering (that was the cause of the black-screen bug).
-    if (_isOccluded) return;
 
     drift_animate(_drift);
 }
 
-- (void)viewDidChangeBackingProperties {
-    [super viewDidChangeBackingProperties];
+#pragma mark - System signals
+
+- (void)screenSaverWillStop:(NSNotification *)note {
+    if (_isPreview) return;
+    DLOG(@"screen saver will stop");
+
+    // Stop the timer and free the GPU engine now, whether or not the host
+    // follows up with -stopAnimation.
+    if (self.isAnimating || _drift) [self stopAnimation];
+
+    // On macOS 14+ legacyScreenSaver stays alive after the screen saver ends
+    // and keeps every view it ever created. Exit so nothing lingers; the
+    // system launches a fresh process next time. Skip it while System
+    // Settings is showing a preview from this process.
+    if (@available(macOS 14.0, *)) {
+        if (!DriftHostIsLegacyScreenSaver() || gAnimatingPreviewCount > 0) return;
+
+        NSUInteger generation = ++gHostExitGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kHostExitDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (generation == gHostExitGeneration && gAnimatingPreviewCount == 0) {
+                DLOG(@"exiting idle legacyScreenSaver host");
+                exit(0);
+            }
+        });
+    }
 }
 
-// Called by AppKit when the window's occlusion state changes. We subscribe in
-// -viewDidMoveToWindow.
+- (void)screensDidSleep:(NSNotification *)note {
+    _screensAsleep = YES;
+    [self updateAnimationInterval];
+}
+
+- (void)screensDidWake:(NSNotification *)note {
+    _screensAsleep = NO;
+    [self updateAnimationInterval];
+}
+
+- (void)sessionDidResignActive:(NSNotification *)note {
+    _sessionInactive = YES;
+    [self updateAnimationInterval];
+}
+
+- (void)sessionDidBecomeActive:(NSNotification *)note {
+    _sessionInactive = NO;
+    [self updateAnimationInterval];
+}
+
+// Subscribed per window in -viewDidMoveToWindow.
 - (void)windowOcclusionStateDidChange:(NSNotification *)note {
     NSWindow *w = self.window;
-    if (!w) { _isOccluded = NO; return; }
-    BOOL visible = (w.occlusionState & NSWindowOcclusionStateVisible) != 0;
-    _isOccluded = !visible;
+    _windowOccluded = w ? (w.occlusionState & NSWindowOcclusionStateVisible) == 0 : YES;
+    [self updateAnimationInterval];
+}
+
+- (void)windowDidChangeScreen:(NSNotification *)note {
+    // Screens can differ in pixel density without differing in backing scale.
+    [self syncDrawableSize];
+}
+
+- (void)viewWillMoveToWindow:(NSWindow *)newWindow {
+    [super viewWillMoveToWindow:newWindow];
+    if (self.window) {
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center removeObserver:self name:NSWindowDidChangeOcclusionStateNotification object:self.window];
+        [center removeObserver:self name:NSWindowDidChangeScreenNotification object:self.window];
+    }
 }
 
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
-    // Always start as visible; rely on notifications to tell us otherwise.
-    _isOccluded = NO;
 
+    // Leaving a window is a definite "not on screen". Entering one starts as
+    // visible; occlusion notifications say otherwise.
     NSWindow *w = self.window;
+    _windowOccluded = (w == nil);
     if (w) {
-        [[NSNotificationCenter defaultCenter]
-            addObserver:self
-               selector:@selector(windowOcclusionStateDidChange:)
-                   name:NSWindowDidChangeOcclusionStateNotification
-                 object:w];
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserver:self
+                   selector:@selector(windowOcclusionStateDidChange:)
+                       name:NSWindowDidChangeOcclusionStateNotification
+                     object:w];
+        [center addObserver:self
+                   selector:@selector(windowDidChangeScreen:)
+                       name:NSWindowDidChangeScreenNotification
+                     object:w];
+    }
+    [self updateAnimationInterval];
+}
+
+#pragma mark - Sizing
+
+// Device pixels per reference pixel (see kReferencePixelsPerMM) on the
+// view's screen, from the screen's physical size. Falls back to the backing
+// scale factor, i.e. sizing in points, if the screen's size is unknown.
+- (CGFloat)engineScaleFactor {
+    NSWindow *window = self.window;
+    CGFloat backing = window ? window.backingScaleFactor : 2.0;
+    NSScreen *screen = window.screen;
+    if (!screen) return backing;
+
+    CGDirectDisplayID display = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+    CGSize mm = CGDisplayScreenSize(display);
+    if (mm.width <= 0 || mm.height <= 0) return backing;
+
+    // Geometric mean over both axes, which doesn't depend on the rotation.
+    NSSize points = screen.frame.size;
+    CGFloat pixelsPerMM = sqrt((points.width * backing) * (points.height * backing)
+                               / (mm.width * mm.height));
+    // TVs and projectors sometimes report a made-up size.
+    if (pixelsPerMM < 1.5 || pixelsPerMM > 20.0) return backing;
+
+    return pixelsPerMM / kReferencePixelsPerMM;
+}
+
+// Keeps the Metal drawable (and the engine) at the view's backing resolution.
+- (void)syncDrawableSize {
+    CALayer *layer = self.layer;
+    if (![layer isKindOfClass:[CAMetalLayer class]]) return;
+
+    NSSize px = [self convertSizeToBacking:self.bounds.size];
+    CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
+    metalLayer.contentsScale = self.window ? self.window.backingScaleFactor : 2.0;
+    metalLayer.drawableSize = CGSizeMake(px.width, px.height);
+
+    if (_drift) {
+        drift_resize(_drift, (uint32_t)px.width, (uint32_t)px.height, (float)[self engineScaleFactor]);
     }
 }
 
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
+    [self syncDrawableSize];
+}
 
-    CALayer *layer = self.layer;
-    if ([layer isKindOfClass:[CAMetalLayer class]]) {
-        NSSize px = [self convertSizeToBacking:newSize];
-        CGFloat scale = self.window ? self.window.backingScaleFactor : 2.0;
-        CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
-        metalLayer.contentsScale = scale;
-        metalLayer.drawableSize = CGSizeMake(px.width, px.height);
-    }
-
-    if (_drift) {
-        NSSize px = [self convertSizeToBacking:newSize];
-        CGFloat scale = self.window ? self.window.backingScaleFactor : 2.0;
-        drift_resize(_drift,
-                     (uint32_t)px.width,
-                     (uint32_t)px.height,
-                     (float)scale);
-    }
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    // E.g. moved between a Retina and a non-Retina display.
+    [self syncDrawableSize];
 }
 
 - (BOOL)isOpaque {
@@ -240,15 +473,32 @@ static NSString *const kPresetKey       = @"DriftPreset";
     return YES;
 }
 
+- (void)selectSavedValuesInSheet {
+    NSInteger presetIndex = [_presetPopup indexOfItemWithTag:(NSInteger)[self savedPreset]];
+    [_presetPopup selectItemAtIndex:(presetIndex < 0 ? 0 : presetIndex)];
+
+    NSInteger rateIndex = [_frameRatePopup indexOfItemWithTag:[self savedFrameRate]];
+    [_frameRatePopup selectItemAtIndex:(rateIndex < 0 ? 0 : rateIndex)];
+}
+
+- (NSPopUpButton *)popupWithFrame:(NSRect)frame items:(NSArray<NSDictionary *> *)items {
+    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:frame pullsDown:NO];
+    // Each item carries its enum value as its tag so reordering the menu
+    // doesn't break the index→enum mapping.
+    for (NSDictionary *item in items) {
+        [popup addItemWithTitle:item[@"title"]];
+        [[popup lastItem] setTag:[item[@"tag"] integerValue]];
+    }
+    return popup;
+}
+
 - (NSWindow *)configureSheet {
     if (_configSheet) {
-        NSInteger idx = [_presetPopup indexOfItemWithTag:(NSInteger)[self savedPreset]];
-        if (idx < 0) idx = 0;
-        [_presetPopup selectItemAtIndex:idx];
+        [self selectSavedValuesInSheet];
         return _configSheet;
     }
 
-    NSRect sheetFrame = NSMakeRect(0, 0, 320, 130);
+    NSRect sheetFrame = NSMakeRect(0, 0, 340, 190);
     _configSheet = [[NSWindow alloc] initWithContentRect:sheetFrame
                                                styleMask:NSWindowStyleMaskTitled
                                                  backing:NSBackingStoreBuffered
@@ -257,34 +507,46 @@ static NSString *const kPresetKey       = @"DriftPreset";
 
     NSView *content = _configSheet.contentView;
 
-    NSTextField *label = [NSTextField labelWithString:@"Color Scheme:"];
-    label.frame = NSMakeRect(20, 80, 100, 20);
-    [content addSubview:label];
+    NSTextField *presetLabel = [NSTextField labelWithString:@"Color Scheme:"];
+    presetLabel.frame = NSMakeRect(20, 140, 100, 20);
+    [content addSubview:presetLabel];
 
-    _presetPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(130, 78, 170, 24)
-                                              pullsDown:NO];
-    // Only expose the three image-based presets — these are the ones that
-    // ship with PNG palettes in colors/ and are reliably rendered. Each item
-    // carries its DriftPreset enum value as its tag so reordering the menu
-    // doesn't break the index→enum mapping.
-    NSArray<NSDictionary *> *presets = @[
-        @{ @"title": @"Gumdrop", @"tag": @(DriftPresetGumdrop) },
-        @{ @"title": @"Silver",  @"tag": @(DriftPresetSilver)  },
-        @{ @"title": @"Freedom", @"tag": @(DriftPresetFreedom) },
-    ];
-    for (NSDictionary *p in presets) {
-        [_presetPopup addItemWithTitle:p[@"title"]];
-        [[_presetPopup lastItem] setTag:[p[@"tag"] integerValue]];
-    }
-    // Select the menu item whose tag matches the saved preset (fall back to
-    // the first item if the saved preset is no longer in the menu).
-    uint32_t saved = [self savedPreset];
-    NSInteger initialIndex = [_presetPopup indexOfItemWithTag:(NSInteger)saved];
-    if (initialIndex < 0) initialIndex = 0;
-    [_presetPopup selectItemAtIndex:initialIndex];
+    // Only expose the image-based presets — these are the ones that ship
+    // with PNG palettes in colors/ and are reliably rendered.
+    _presetPopup = [self popupWithFrame:NSMakeRect(130, 138, 190, 24) items:@[
+        @{ @"title": @"Gumdrop",    @"tag": @(DriftPresetGumdrop)   },
+        @{ @"title": @"Silver",     @"tag": @(DriftPresetSilver)    },
+        @{ @"title": @"Freedom",    @"tag": @(DriftPresetFreedom)   },
+        @{ @"title": @"Space Gray", @"tag": @(DriftPresetSpaceGray) },
+        @{ @"title": @"Aurora",     @"tag": @(DriftPresetAurora)    },
+        @{ @"title": @"Atlas",      @"tag": @(DriftPresetAtlas)     },
+        @{ @"title": @"Emerald",    @"tag": @(DriftPresetEmerald)   },
+        @{ @"title": @"Glacier",    @"tag": @(DriftPresetGlacier)   },
+        @{ @"title": @"Ember",      @"tag": @(DriftPresetEmber)     },
+    ]];
     [content addSubview:_presetPopup];
 
-    NSButton *okButton = [[NSButton alloc] initWithFrame:NSMakeRect(220, 20, 80, 32)];
+    NSTextField *rateLabel = [NSTextField labelWithString:@"Frame Rate:"];
+    rateLabel.frame = NSMakeRect(20, 106, 100, 20);
+    [content addSubview:rateLabel];
+
+    _frameRatePopup = [self popupWithFrame:NSMakeRect(130, 104, 190, 24) items:@[
+        @{ @"title": @"Auto",                @"tag": @(DriftFrameRateAuto) },
+        @{ @"title": @"60 fps",              @"tag": @(DriftFrameRate60)   },
+        @{ @"title": @"30 fps (lighter)",    @"tag": @(DriftFrameRate30)   },
+    ]];
+    [content addSubview:_frameRatePopup];
+
+    NSTextField *rateHint = [NSTextField wrappingLabelWithString:
+        @"Auto uses 30 fps in Low Power Mode or when the Mac is running hot."];
+    rateHint.frame = NSMakeRect(132, 62, 188, 36);
+    rateHint.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+    rateHint.textColor = [NSColor secondaryLabelColor];
+    [content addSubview:rateHint];
+
+    [self selectSavedValuesInSheet];
+
+    NSButton *okButton = [[NSButton alloc] initWithFrame:NSMakeRect(240, 16, 80, 32)];
     okButton.title = @"OK";
     okButton.bezelStyle = NSBezelStyleRounded;
     okButton.keyEquivalent = @"\r";
@@ -292,7 +554,7 @@ static NSString *const kPresetKey       = @"DriftPreset";
     okButton.action = @selector(configOK:);
     [content addSubview:okButton];
 
-    NSButton *cancelButton = [[NSButton alloc] initWithFrame:NSMakeRect(130, 20, 80, 32)];
+    NSButton *cancelButton = [[NSButton alloc] initWithFrame:NSMakeRect(150, 16, 80, 32)];
     cancelButton.title = @"Cancel";
     cancelButton.bezelStyle = NSBezelStyleRounded;
     cancelButton.keyEquivalent = @"\033";
@@ -315,18 +577,18 @@ static NSString *const kPresetKey       = @"DriftPreset";
 }
 
 - (IBAction)configOK:(id)sender {
-    NSInteger selectedIndex = _presetPopup.indexOfSelectedItem;
-    // Map the popup index → DriftPreset enum value via the title's tag.
-    uint32_t preset = (uint32_t)[_presetPopup itemAtIndex:selectedIndex].tag;
-    [self savePreset:preset];
+    uint32_t preset = (uint32_t)_presetPopup.selectedItem.tag;
+    DriftFrameRate frameRate = (DriftFrameRate)_frameRatePopup.selectedItem.tag;
+    [self savePreset:preset frameRate:frameRate];
 
-    if (_drift) {
+    _frameRate = frameRate;
+    [self updateAnimationInterval];
+    if (_drift && preset != _currentPreset) {
         _currentPreset = preset;
         drift_set_preset(_drift, preset);
     }
-    // Other processes' DriftV2 views (each display in wallpaper mode) will
-    // detect the change within ~1 second via the polling loop in
-    // -animateOneFrame and apply it themselves.
+    // Other processes' DriftV2 views (e.g. one per display) pick the change
+    // up within a couple of seconds via -pollSettings.
 
     [self dismissSheet];
 }

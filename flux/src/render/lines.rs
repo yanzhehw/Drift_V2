@@ -34,8 +34,7 @@ struct LineUniforms {
 impl LineUniforms {
     fn new(screen_size: wgpu::Extent3d, grid: &Grid, settings: &Settings) -> Self {
         // TODO: can we compute the scale factor from the grid?
-        let line_scale_factor =
-            get_line_scale_factor(screen_size.width as f32, screen_size.height as f32);
+        let line_scale_factor = get_line_scale_factor(screen_size.height as f32);
 
         Self {
             aspect: grid.aspect_ratio,
@@ -118,6 +117,8 @@ pub struct Context {
     endpoint_vertex_buffer: wgpu::Buffer,
     basepoints_buffer: wgpu::Buffer,
     view_uniform_buffer: wgpu::Buffer,
+    // The transform currently stored in `view_uniform_buffer`.
+    view_transform: ViewTransform,
     line_uniforms: LineUniforms,
     line_uniform_buffer: wgpu::Buffer,
     line_buffers: Vec<wgpu::Buffer>,
@@ -186,7 +187,13 @@ impl Context {
         );
     }
 
-    pub fn set_view_transform(&self, queue: &wgpu::Queue, view_transform: ViewTransform) {
+    pub fn set_view_transform(&mut self, queue: &wgpu::Queue, view_transform: ViewTransform) {
+        // The transform rarely changes; skip the per-frame upload when it hasn't.
+        if view_transform == self.view_transform {
+            return;
+        }
+        self.view_transform = view_transform;
+
         let view_matrix = ViewUniform::from(view_transform);
         queue.write_buffer(
             &self.view_uniform_buffer,
@@ -830,6 +837,7 @@ impl Context {
             endpoint_vertex_buffer,
             basepoints_buffer,
             view_uniform_buffer,
+            view_transform: ViewTransform::default(),
             line_uniforms,
             line_uniform_buffer,
             line_buffers,
@@ -860,10 +868,10 @@ impl Context {
         lines
     }
 
-    pub fn place_lines<'cpass>(
-        &'cpass mut self,
-        cpass: &mut wgpu::ComputePass<'cpass>,
-        velocity_bind_group: &'cpass wgpu::BindGroup,
+    pub fn place_lines(
+        &mut self,
+        cpass: &mut wgpu::ComputePass<'_>,
+        velocity_bind_group: &wgpu::BindGroup,
     ) {
         cpass.set_pipeline(&self.place_lines_pipeline);
         cpass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -896,10 +904,13 @@ impl Context {
     }
 }
 
-fn get_line_scale_factor(width: f32, height: f32) -> f32 {
-    let aspect_ratio = width / height;
-    let p = 1.0 / aspect_ratio;
-    1.0 / ((1.0 - p) * width + p * height).min(2000.0)
+// Converts line sizes to clip-space units (1 unit = half the screen height) so
+// that lines have the same logical size on every screen, whatever its aspect
+// ratio, orientation or size. The constant reproduces the original sizing of a
+// 16:9 screen. (The original factor also depended on the aspect ratio, and was
+// capped so lines grew on screens wider than ~2700 logical pixels.)
+fn get_line_scale_factor(height: f32) -> f32 {
+    0.746 / height
 }
 
 #[rustfmt::skip]
