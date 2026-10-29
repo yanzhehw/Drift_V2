@@ -146,7 +146,21 @@ Open **System Settings > Screen Saver**, select **Drift_V2**, then click **Optio
 | 60 fps | Always 60 fps |
 | 30 fps (lighter) | Always 30 fps, using roughly 40% less CPU |
 
-Drift_V2 only renders while it's on screen. It pauses when covered, while the displays sleep, or when you switch users, and it shuts down completely once the screen saver ends.
+Drift_V2 pauses while the displays sleep or when you switch users, and it shuts down completely once the screen saver ends. Local preview windows also pause when covered. The system's remotely displayed screen saver keeps animating even when its hidden source window reports that it is covered.
+
+Display and layout changes are reconciled before each frame, including changes between Retina, landscape, and portrait displays. Drawable acquisition has a timeout so display transitions cannot leave the render loop waiting indefinitely; temporary initialization failures retry automatically.
+
+## Development verification
+
+With Rust and Xcode Command Line Tools installed:
+
+```sh
+./drift/tests/run.sh
+./script/build_and_run.sh --verify
+cargo run -p drift-v2-screensaver --example verify_rendering --release
+```
+
+These check view lifecycle recovery, actual Metal frame presentation and geometry in temporary display-sized windows (about 16 seconds), and GPU motion at laptop/landscape/portrait resolutions. The GPU checks also exercise a simulated long pause and the simulation clock rollover. Results are written under `target/preview-host/` and `target/verification/`. They do not install the saver or change Screen Saver settings. Use `./script/build_and_run.sh` (or the Codex Run button) for an interactive local preview.
 
 ## Uninstall
 

@@ -22,6 +22,7 @@ static const NSTimeInterval kPreviewTickInterval  = 60.0;  // preview is a stati
 
 // How often to re-read preferences (preset, frame rate) and power state.
 static const CFTimeInterval kSettingsPollInterval = 2.0;
+static const CFTimeInterval kEngineRetryInterval = 2.0;
 
 // Delay between the screen saver stopping and the host process exiting.
 static const NSTimeInterval kHostExitDelay = 1.0;
@@ -57,14 +58,19 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
     uint32_t _currentPreset;    // Last preset applied to _drift.
     DriftFrameRate _frameRate;  // Saved frame-rate preference.
 
-    // Reasons not to render. Each is set only by an explicit signal: a
-    // transiently-zero occlusionState during window setup/teardown must not
-    // stop rendering (that was the cause of the black-screen bug).
-    BOOL _windowOccluded;
+    // Workspace signals apply to the entire session. Window visibility is
+    // checked live instead of latching a notification until another arrives.
     BOOL _screensAsleep;
     BOOL _sessionInactive;
+    BOOL _wasRendering;
+
+    NSScreen *_sizingScreen;
+    CGFloat _sizingBackingScale;
+    NSSize _sizingScreenSize;
+    CGFloat _cachedEngineScale;
 
     CFTimeInterval _nextSettingsPoll;
+    CFTimeInterval _nextEngineAttempt;
 }
 @property (nonatomic, strong) NSWindow *configSheet;
 @property (nonatomic, strong) NSPopUpButton *presetPopup;
@@ -195,7 +201,16 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
 #pragma mark - Render state
 
 - (BOOL)shouldRender {
-    return !_windowOccluded && !_screensAsleep && !_sessionInactive;
+    if (_screensAsleep || _sessionInactive || !self.window) return NO;
+    if (NSIsEmptyRect(self.frame) || NSIsEmptyRect(self.bounds)) return NO;
+    NSSize px = [self drawablePixelSize];
+    if (px.width < 1 || px.height < 1) return NO;
+
+    // legacyScreenSaver exports its view to another process. Its local
+    // window's occlusion state does not describe the displayed remote layer.
+    // The explicit stop/sleep/session signals still suspend that host.
+    if (DriftHostIsLegacyScreenSaver()) return YES;
+    return (self.window.occlusionState & NSWindowOcclusionStateVisible) != 0;
 }
 
 - (BOOL)wantsReducedFrameRate {
@@ -218,8 +233,9 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
 - (void)updateAnimationInterval {
     if (_isPreview) return;
 
+    _wasRendering = [self shouldRender];
     NSTimeInterval interval;
-    if (![self shouldRender]) {
+    if (!_wasRendering) {
         interval = kHiddenTickInterval;
     } else if ([self wantsReducedFrameRate]) {
         interval = kReducedFrameInterval;
@@ -256,10 +272,14 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
 #pragma mark - ScreenSaverView
 
 - (void)createEngineIfNeeded {
-    if (_drift) return;
+    if (_drift || ![self shouldRender]) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now < _nextEngineAttempt) return;
 
     [self syncDrawableSize];
-    NSSize px = [self convertSizeToBacking:self.bounds.size];
+    NSSize px = [self drawablePixelSize];
+    if (px.width < 1 || px.height < 1) return;
+    _nextEngineAttempt = now + kEngineRetryInterval;
     CGFloat scale = [self engineScaleFactor];
 
     uint32_t preset = [self savedPreset];
@@ -273,6 +293,9 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
                           preset,
                           0u);
     DLOG(@"drift_create returned: %p", _drift);
+    // wgpu's Metal surface configuration disables drawable timeouts. Restore
+    // them so a display transition cannot block the host's main thread forever.
+    [self syncDrawableSize];
 }
 
 - (void)startAnimation {
@@ -287,6 +310,7 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
     // Preview mode shows the static thumbnail — no engine, no animation.
     if (_isPreview) return;
 
+    _nextEngineAttempt = 0;
     [self createEngineIfNeeded];
     _nextSettingsPoll = CACurrentMediaTime() + kSettingsPollInterval;
     [self updateAnimationInterval];
@@ -307,9 +331,18 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
 }
 
 - (void)animateOneFrame {
-    if (_isPreview) return;  // preview shows the static thumbnail
+    if (_isPreview || !self.isAnimating) return;
+    // Also run this on idle ticks: a missed visibility notification must not
+    // leave an otherwise visible screen saver permanently paused.
+    BOOL render = [self shouldRender];
+    if (render != _wasRendering) [self updateAnimationInterval];
+    if (!render) return;
+
+    [self createEngineIfNeeded];
     if (!_drift) return;
-    if (![self shouldRender]) return;
+    // AppKit can change a backing layer after a frame/bounds callback. Reconcile
+    // its drawable with the engine immediately before acquiring the next frame.
+    [self syncDrawableSize];
 
     CFTimeInterval now = CACurrentMediaTime();
     if (now >= _nextSettingsPoll) {
@@ -372,13 +405,12 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
 
 // Subscribed per window in -viewDidMoveToWindow.
 - (void)windowOcclusionStateDidChange:(NSNotification *)note {
-    NSWindow *w = self.window;
-    _windowOccluded = w ? (w.occlusionState & NSWindowOcclusionStateVisible) == 0 : YES;
     [self updateAnimationInterval];
 }
 
 - (void)windowDidChangeScreen:(NSNotification *)note {
     // Screens can differ in pixel density without differing in backing scale.
+    _sizingScreen = nil;
     [self syncDrawableSize];
 }
 
@@ -394,10 +426,7 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
 
-    // Leaving a window is a definite "not on screen". Entering one starts as
-    // visible; occlusion notifications say otherwise.
     NSWindow *w = self.window;
-    _windowOccluded = (w == nil);
     if (w) {
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
         [center addObserver:self
@@ -409,6 +438,8 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
                        name:NSWindowDidChangeScreenNotification
                      object:w];
     }
+    _nextEngineAttempt = 0;
+    [self syncDrawableSize];
     [self updateAnimationInterval];
 }
 
@@ -423,37 +454,67 @@ static BOOL DriftHostIsLegacyScreenSaver(void) {
     NSScreen *screen = window.screen;
     if (!screen) return backing;
 
+    NSSize points = screen.frame.size;
+    if (screen == _sizingScreen && backing == _sizingBackingScale &&
+        NSEqualSizes(points, _sizingScreenSize)) return _cachedEngineScale;
+    _sizingScreen = screen;
+    _sizingBackingScale = backing;
+    _sizingScreenSize = points;
+    _cachedEngineScale = backing;
+
     CGDirectDisplayID display = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
     CGSize mm = CGDisplayScreenSize(display);
     if (mm.width <= 0 || mm.height <= 0) return backing;
 
     // Geometric mean over both axes, which doesn't depend on the rotation.
-    NSSize points = screen.frame.size;
     CGFloat pixelsPerMM = sqrt((points.width * backing) * (points.height * backing)
                                / (mm.width * mm.height));
     // TVs and projectors sometimes report a made-up size.
     if (pixelsPerMM < 1.5 || pixelsPerMM > 20.0) return backing;
 
-    return pixelsPerMM / kReferencePixelsPerMM;
+    _cachedEngineScale = pixelsPerMM / kReferencePixelsPerMM;
+    return _cachedEngineScale;
 }
 
 // Keeps the Metal drawable (and the engine) at the view's backing resolution.
+- (NSSize)drawablePixelSize {
+    NSSize px = [self convertSizeToBacking:self.bounds.size];
+    if (!isfinite(px.width) || !isfinite(px.height) ||
+        px.width < 1 || px.height < 1 ||
+        px.width > UINT32_MAX || px.height > UINT32_MAX) return NSZeroSize;
+    return NSMakeSize(round(px.width), round(px.height));
+}
+
 - (void)syncDrawableSize {
     CALayer *layer = self.layer;
-    if (![layer isKindOfClass:[CAMetalLayer class]]) return;
+    if (!self.window || ![layer isKindOfClass:[CAMetalLayer class]]) return;
 
-    NSSize px = [self convertSizeToBacking:self.bounds.size];
+    NSSize px = [self drawablePixelSize];
+    if (px.width < 1 || px.height < 1) return;
     CAMetalLayer *metalLayer = (CAMetalLayer *)layer;
-    metalLayer.contentsScale = self.window ? self.window.backingScaleFactor : 2.0;
-    metalLayer.drawableSize = CGSizeMake(px.width, px.height);
+    CGFloat backing = self.window.backingScaleFactor;
+    if (metalLayer.contentsScale != backing) metalLayer.contentsScale = backing;
+    if (!CGSizeEqualToSize(metalLayer.drawableSize, px)) metalLayer.drawableSize = px;
 
     if (_drift) {
         drift_resize(_drift, (uint32_t)px.width, (uint32_t)px.height, (float)[self engineScaleFactor]);
     }
+    // Must follow drift_resize: surface.configure resets this to NO.
+    metalLayer.allowsNextDrawableTimeout = YES;
 }
 
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
+    [self syncDrawableSize];
+}
+
+- (void)setBoundsSize:(NSSize)newSize {
+    [super setBoundsSize:newSize];
+    [self syncDrawableSize];
+}
+
+- (void)layout {
+    [super layout];
     [self syncDrawableSize];
 }
 
